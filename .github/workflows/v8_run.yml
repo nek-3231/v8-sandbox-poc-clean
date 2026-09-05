@@ -1,0 +1,17 @@
+name: V8 Sandbox Exploit Runner
+on: [push, workflow_dispatch]
+jobs:
+  run-exploit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull d8 binary
+        run: |
+          mkdir -p out/x64.release
+          sudo apt-get update && sudo apt-get install -y xz-utils
+          curl -sL https://nodejs.org/dist/v20.11.0/node-v20.11.0-linux-x64.tar.xz | tar xJ --strip-components=2 -C out/x64.release ./node-v20.11.0-linux-x64/bin/node
+          mv out/x64.release/node out/x64.release/d8
+          chmod +x out/x64.release/d8
+      - name: Ejecutar Sandbox PoC
+        run: |
+          ./out/x64.release/d8 --allow-natives-syntax poc.js

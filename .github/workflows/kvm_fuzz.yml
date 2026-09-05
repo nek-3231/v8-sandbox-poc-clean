@@ -1,0 +1,59 @@
+name: KVM Ring0 Fuzzing Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  fuzz-ring0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install QEMU & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils build-essential
+
+      - name: Validate Environment & KVM Hardware
+        run: |
+          echo "[*] Verificando permisos de /dev/kvm en el runner..."
+          ls -la /dev/kvm
+          sudo chmod 666 /dev/kvm
+          
+          echo "[*] Verificando existencia de bzImage y rootfs..."
+          ls -la bzImage rootfs.cpio.gz || { echo "[X] Faltan los binarios en el repositorio, cabrón!"; exit 1; }
+
+      - name: Execute KVM Harness in QEMU
+        run: |
+          LOG_FILE="serial_output.log"
+          TIMEOUT_LIMIT="12m"
+
+          echo "[*] Arrancando QEMU con KVM por hardware nativo..."
+          timeout "$TIMEOUT_LIMIT" qemu-system-x86_64 \
+            -enable-kvm -cpu host,vmx=+vmx \
+            -m 2G -smp 2 \
+            -kernel bzImage \
+            -initrd rootfs.cpio.gz \
+            -append "console=ttyS0 panic=1" \
+            -nographic \
+            -serial "file:$LOG_FILE" || echo "[!] QEMU finalizó ciclo."
+
+          if [ -s "$LOG_FILE" ]; then
+              echo "[*] Telemetría serial capturada con éxito:"
+              tail -n 40 "$LOG_FILE"
+          else
+              echo "[X] Error: El log serial está vacío."
+              exit 1
+          fi
+
+      - name: Upload Crash Telemetry Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kvm-crash-telemetry
+          path: serial_output.log

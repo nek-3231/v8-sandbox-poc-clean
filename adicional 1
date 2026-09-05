@@ -1,0 +1,2 @@
+gclient sync --no-history --shallow
+ninja -C out/Default d8 -j2

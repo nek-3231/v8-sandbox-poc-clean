@@ -1,0 +1,68 @@
+name: V8-Sandbox-PoC-Pipeline
+
+on: [push, workflow_dispatch]
+
+jobs:
+  exploit-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space (ENOSPC Mitig)
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/hostedtoolcache/CodeCoverage
+          sudo rm -rf /usr/share/dotnet
+          docker image prune --all --force
+          df -h
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3 git curl ninja-build clang pkg-config
+
+      - name: Restore Depot Tools & V8 Cache
+        uses: actions/cache@v4
+        id: v8-cache
+        with:
+          path: |
+            ~/.depot_tools
+            v8
+          key: v8-sandbox-cache-v3-${{ hashFiles('.github/workflows/v8_poc.yml') }}
+          restore-keys: |
+            v8-sandbox-cache-v3-
+
+      - name: Setup Depot Tools Path
+        run: |
+          echo "HOME=/home/runner" >> $GITHUB_ENV
+          echo "PATH=$HOME/.depot_tools:$PATH" >> $GITHUB_ENV
+
+      - name: Fetch V8 Source (if missing)
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        run: |
+          export PATH="$HOME/.depot_tools:$PATH"
+          mkdir -p v8 && cd v8
+          fetch v8
+          cd v8
+          git checkout 15.5.13 || true
+          gclient sync --no-history --shallow
+
+      - name: Build V8 with Memory Corruption API
+        run: |
+          export PATH="$HOME/.depot_tools:$PATH"
+          cd v8/v8
+          if [ ! -f "out.gn/x64.release/d8" ]; then
+            ./tools/dev/v8gen.py x64.release -- 'v8_enable_sandbox=true' 'v8_enable_memory_corruption_api=true' 'is_debug=false' 'symbol_level=0' 'blink_symbol_level=0'
+            ninja -C out.gn/x64.release d8
+          else
+            printenv "[+] d8 cached, skipping full compilation..."
+          fi
+
+      - name: Exec PoC
+        run: |
+          POC_FILE=$(find . -maxdepth 3 -name "*.js" | grep -v "node_modules" | head -n 1)
+          echo "[+] Target PoC: $POC_FILE"
+          ./v8/v8/out.gn/x64.release/d8 --allow-natives-syntax --sandbox-testing "$POC_FILE"
